@@ -1,0 +1,198 @@
+---
+# Deployment - Mail Provisioner
+# Automatyczne tworzenie/archiwizacja mailboxów na podstawie zmian w FreeIPA
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mail-provisioner
+  namespace: mail-system
+  labels:
+    app: mail-provisioner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mail-provisioner
+  template:
+    metadata:
+      labels:
+        app: mail-provisioner
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/worker: "true"
+      containers:
+        - name: provisioner
+          image: ghcr.io/zsel-opole/mail-provisioner:latest
+          envFrom:
+            - secretRef:
+                name: provisioner-secrets
+            - configMapRef:
+                name: provisioner-config
+          volumeMounts:
+            - name: mail-storage
+              mountPath: /var/mail/vhosts
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import sys; sys.exit(0)"
+            initialDelaySeconds: 30
+            periodSeconds: 60
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import sys; sys.exit(0)"
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: mail-storage
+          persistentVolumeClaim:
+            claimName: mail-storage
+      restartPolicy: Always
+---
+# ConfigMap - konfiguracja provisionera
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: provisioner-config
+  namespace: mail-system
+data:
+  FREEIPA_SERVER: "ipa-master.zsel.opole.pl"
+  FREEIPA_BASE_DN: "dc=zsel,dc=opole,dc=pl"
+  MAIL_DOMAIN: "zsel.opole.pl"
+  MAIL_STORAGE_PATH: "/var/mail/vhosts"
+  
+  # Quota settings (bytes)
+  QUOTA_STUDENT: "1073741824"      # 1 GB
+  QUOTA_TEACHER: "5368709120"       # 5 GB
+  QUOTA_ADMIN: "10737418240"        # 10 GB
+  QUOTA_DIRECTOR: "21474836480"     # 20 GB
+  
+  # Retention settings (days)
+  GRADUATE_READONLY_DAYS: "365"
+  BACKUP_RETENTION_DAYS: "30"
+  
+  # Logging
+  LOG_LEVEL: "INFO"
+---
+# Secret - credentials provisionera
+apiVersion: v1
+kind: Secret
+metadata:
+  name: provisioner-secrets
+  namespace: mail-system
+type: Opaque
+stringData:
+  FREEIPA_USERNAME: "mailprovisioner"
+  FREEIPA_PASSWORD: "placeholder-zmien-mnie"
+---
+# CronJob - daily cleanup expired mailboxes
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mail-cleanup
+  namespace: mail-system
+spec:
+  schedule: "0 3 * * *"  # Codziennie o 3:00
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            node-role.kubernetes.io/worker: "true"
+          containers:
+            - name: cleanup
+              image: ghcr.io/zsel-opole/mail-provisioner:latest
+              command:
+                - python
+                - -m
+                - src.cleanup
+              envFrom:
+                - secretRef:
+                    name: provisioner-secrets
+                - configMapRef:
+                    name: provisioner-config
+              volumeMounts:
+                - name: mail-storage
+                  mountPath: /var/mail/vhosts
+              resources:
+                limits:
+                  memory: "256Mi"
+                  cpu: "200m"
+          volumes:
+            - name: mail-storage
+              persistentVolumeClaim:
+                claimName: mail-storage
+          restartPolicy: OnFailure
+---
+# CronJob - weekly backup verification
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mail-backup-verify
+  namespace: mail-system
+spec:
+  schedule: "0 4 * * 0"  # Niedziela o 4:00
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            node-role.kubernetes.io/worker: "true"
+          containers:
+            - name: backup-verify
+              image: ghcr.io/zsel-opole/mail-provisioner:latest
+              command:
+                - python
+                - -m
+                - src.backup_verify
+              envFrom:
+                - secretRef:
+                    name: provisioner-secrets
+                - configMapRef:
+                    name: provisioner-config
+              resources:
+                limits:
+                  memory: "128Mi"
+                  cpu: "100m"
+          restartPolicy: OnFailure
+---
+# ServiceMonitor - metryki Prometheus
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: mail-provisioner
+  namespace: mail-system
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: mail-provisioner
+  endpoints:
+    - port: metrics
+      interval: 30s
+      path: /metrics
+---
+# PodDisruptionBudget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mail-provisioner-pdb
+  namespace: mail-system
+spec:
+  minAvailable: 0
+  selector:
+    matchLabels:
+      app: mail-provisioner

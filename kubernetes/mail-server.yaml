@@ -1,0 +1,393 @@
+---
+# Namespace dla serwera pocztowego
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mail-system
+  labels:
+    app.kubernetes.io/part-of: zsel-platform
+    app.kubernetes.io/component: mail
+---
+# ConfigMap - konfiguracja Postfix
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postfix-config
+  namespace: mail-system
+data:
+  main.cf: |
+    # Postfix main configuration
+    myhostname = mail.zsel.opole.pl
+    mydomain = zsel.opole.pl
+    myorigin = $mydomain
+    
+    # LDAP (FreeIPA)
+    virtual_mailbox_domains = zsel.opole.pl
+    virtual_mailbox_base = /var/mail/vhosts
+    virtual_mailbox_maps = ldap:/etc/postfix/ldap-mailboxes.cf
+    virtual_alias_maps = ldap:/etc/postfix/ldap-aliases.cf
+    
+    # TLS
+    smtpd_use_tls = yes
+    smtpd_tls_cert_file = /etc/ssl/certs/mail.crt
+    smtpd_tls_key_file = /etc/ssl/private/mail.key
+    smtpd_tls_security_level = may
+    
+    # SASL Authentication
+    smtpd_sasl_type = dovecot
+    smtpd_sasl_path = private/auth
+    smtpd_sasl_auth_enable = yes
+    smtpd_recipient_restrictions = 
+      permit_sasl_authenticated,
+      permit_mynetworks,
+      reject_unauth_destination
+    
+    # Limits
+    message_size_limit = 26214400
+    mailbox_size_limit = 1073741824
+    
+    # Logging
+    maillog_file = /dev/stdout
+  
+  ldap-mailboxes.cf: |
+    server_host = ldap://ipa-master.zsel.opole.pl
+    search_base = dc=zsel,dc=opole,dc=pl
+    query_filter = (&(mail=%s)(!(memberOf=cn=disabled-users,cn=groups,cn=accounts,dc=zsel,dc=opole,dc=pl)))
+    result_attribute = mail
+    result_format = %d/%u/Maildir/
+    bind = yes
+    bind_dn = uid=mailservice,cn=sysaccounts,cn=etc,dc=zsel,dc=opole,dc=pl
+    bind_pw = MAIL_LDAP_PASSWORD
+  
+  ldap-archived.cf: |
+    server_host = ldap://ipa-master.zsel.opole.pl
+    search_base = ou=absolwenci,dc=zsel,dc=opole,dc=pl
+    query_filter = (&(mail=%s)(memberOf=cn=archived-users,cn=groups,cn=accounts,dc=zsel,dc=opole,dc=pl))
+    result_attribute = mail
+    result_format = REJECT Konto archiwalne - wysylanie zablokowane
+    bind = yes
+    bind_dn = uid=mailservice,cn=sysaccounts,cn=etc,dc=zsel,dc=opole,dc=pl
+    bind_pw = MAIL_LDAP_PASSWORD
+---
+# ConfigMap - konfiguracja Dovecot
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dovecot-config
+  namespace: mail-system
+data:
+  dovecot.conf: |
+    # Dovecot configuration
+    protocols = imap lmtp
+    
+    # Logging
+    log_path = /dev/stderr
+    info_log_path = /dev/stdout
+    
+    # Mail location
+    mail_location = maildir:/var/mail/vhosts/%d/%n/Maildir
+    
+    # Authentication via LDAP
+    passdb {
+      driver = ldap
+      args = /etc/dovecot/ldap.conf
+    }
+    
+    userdb {
+      driver = ldap
+      args = /etc/dovecot/ldap.conf
+    }
+    
+    # SSL
+    ssl = required
+    ssl_cert = </etc/ssl/certs/mail.crt
+    ssl_key = </etc/ssl/private/mail.key
+    ssl_min_protocol = TLSv1.2
+    
+    # LMTP service (for Postfix delivery)
+    service lmtp {
+      inet_listener lmtp {
+        address = 0.0.0.0
+        port = 24
+      }
+    }
+    
+    # Auth service for Postfix
+    service auth {
+      unix_listener /var/spool/postfix/private/auth {
+        mode = 0660
+        user = postfix
+        group = postfix
+      }
+    }
+    
+    # Quotas
+    mail_plugins = $mail_plugins quota
+    plugin {
+      quota = maildir:User quota
+      quota_rule = *:storage=1G
+      quota_rule2 = Trash:storage=+100M
+      quota_grace = 10%%
+      quota_status_success = DUNNO
+      quota_status_nouser = DUNNO
+      quota_status_overquota = "452 4.2.2 Mailbox is full"
+    }
+  
+  ldap.conf: |
+    hosts = ipa-master.zsel.opole.pl
+    dn = uid=mailservice,cn=sysaccounts,cn=etc,dc=zsel,dc=opole,dc=pl
+    dnpass = MAIL_LDAP_PASSWORD
+    tls = yes
+    tls_require_cert = demand
+    
+    base = dc=zsel,dc=opole,dc=pl
+    scope = subtree
+    
+    user_filter = (&(objectClass=person)(mail=%u@%d))
+    pass_filter = (&(objectClass=person)(mail=%u@%d))
+    pass_attrs = mail=user,userPassword=password
+    
+    user_attrs = \
+      =home=/var/mail/vhosts/%{ldap:mail}, \
+      =mail=maildir:/var/mail/vhosts/%{ldap:mail}/Maildir
+---
+# Secret - hasła LDAP i TLS
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mail-secrets
+  namespace: mail-system
+type: Opaque
+stringData:
+  MAIL_LDAP_PASSWORD: "placeholder-zmien-mnie"
+---
+# PVC - storage dla mailboxów
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mail-storage
+  namespace: mail-system
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn-ssd-replicated
+  resources:
+    requests:
+      storage: 500Gi
+---
+# Deployment - Postfix + Dovecot
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mail-server
+  namespace: mail-system
+  labels:
+    app: mail-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mail-server
+  template:
+    metadata:
+      labels:
+        app: mail-server
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/worker: "true"
+      containers:
+        - name: postfix
+          image: ghcr.io/zsel-opole/postfix:latest
+          ports:
+            - containerPort: 25
+              name: smtp
+            - containerPort: 587
+              name: submission
+          volumeMounts:
+            - name: postfix-config
+              mountPath: /etc/postfix/main.cf
+              subPath: main.cf
+            - name: postfix-config
+              mountPath: /etc/postfix/ldap-mailboxes.cf
+              subPath: ldap-mailboxes.cf
+            - name: postfix-config
+              mountPath: /etc/postfix/ldap-archived.cf
+              subPath: ldap-archived.cf
+            - name: mail-storage
+              mountPath: /var/mail/vhosts
+            - name: tls-certs
+              mountPath: /etc/ssl/certs/mail.crt
+              subPath: tls.crt
+            - name: tls-certs
+              mountPath: /etc/ssl/private/mail.key
+              subPath: tls.key
+          envFrom:
+            - secretRef:
+                name: mail-secrets
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+        
+        - name: dovecot
+          image: ghcr.io/zsel-opole/dovecot:latest
+          ports:
+            - containerPort: 143
+              name: imap
+            - containerPort: 993
+              name: imaps
+            - containerPort: 24
+              name: lmtp
+          volumeMounts:
+            - name: dovecot-config
+              mountPath: /etc/dovecot/dovecot.conf
+              subPath: dovecot.conf
+            - name: dovecot-config
+              mountPath: /etc/dovecot/ldap.conf
+              subPath: ldap.conf
+            - name: mail-storage
+              mountPath: /var/mail/vhosts
+            - name: tls-certs
+              mountPath: /etc/ssl/certs/mail.crt
+              subPath: tls.crt
+            - name: tls-certs
+              mountPath: /etc/ssl/private/mail.key
+              subPath: tls.key
+          envFrom:
+            - secretRef:
+                name: mail-secrets
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+      
+      volumes:
+        - name: postfix-config
+          configMap:
+            name: postfix-config
+        - name: dovecot-config
+          configMap:
+            name: dovecot-config
+        - name: mail-storage
+          persistentVolumeClaim:
+            claimName: mail-storage
+        - name: tls-certs
+          secret:
+            secretName: mail-tls-cert
+---
+# Service - ekspozycja portów
+apiVersion: v1
+kind: Service
+metadata:
+  name: mail-server
+  namespace: mail-system
+spec:
+  type: LoadBalancer
+  loadBalancerIP: 10.189.20.25
+  selector:
+    app: mail-server
+  ports:
+    - name: smtp
+      port: 25
+      targetPort: 25
+    - name: submission
+      port: 587
+      targetPort: 587
+    - name: imap
+      port: 143
+      targetPort: 143
+    - name: imaps
+      port: 993
+      targetPort: 993
+---
+# Ingress - webmail
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: webmail
+  namespace: mail-system
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - mail.zsel.opole.pl
+      secretName: mail-tls-cert
+  rules:
+    - host: mail.zsel.opole.pl
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: roundcube
+                port:
+                  number: 80
+---
+# Deployment - Roundcube Webmail
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: roundcube
+  namespace: mail-system
+  labels:
+    app: roundcube
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: roundcube
+  template:
+    metadata:
+      labels:
+        app: roundcube
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/worker: "true"
+      containers:
+        - name: roundcube
+          image: roundcube/roundcubemail:1.6-apache
+          ports:
+            - containerPort: 80
+          env:
+            - name: ROUNDCUBEMAIL_DEFAULT_HOST
+              value: "ssl://mail-server.mail-system.svc.cluster.local"
+            - name: ROUNDCUBEMAIL_DEFAULT_PORT
+              value: "993"
+            - name: ROUNDCUBEMAIL_SMTP_SERVER
+              value: "tls://mail-server.mail-system.svc.cluster.local"
+            - name: ROUNDCUBEMAIL_SMTP_PORT
+              value: "587"
+            - name: ROUNDCUBEMAIL_SKIN
+              value: "elastic"
+            - name: ROUNDCUBEMAIL_PLUGINS
+              value: "archive,zipdownload,managesieve"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+---
+# Service - Roundcube
+apiVersion: v1
+kind: Service
+metadata:
+  name: roundcube
+  namespace: mail-system
+spec:
+  selector:
+    app: roundcube
+  ports:
+    - port: 80
+      targetPort: 80
